@@ -43,6 +43,20 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._late_finished_sending: set[str] = set()
         logger.debug("store_async: %s", self.store_async)
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Register final KV memory with xDS once after vLLM allocates it.
+
+        Registration errors abort worker initialization. The backend owns the
+        registrations until shutdown; per-request restore only uses handles.
+        """
+        super().register_kv_caches(kv_caches)
+        engine = self.lmcache_engine
+        if engine is None or engine.storage_manager is None:
+            return
+        backend = engine.storage_manager.storage_backends.get("XDSBackend")
+        if backend is not None:
+            backend.register_kv_caches(engine.gpu_connector, list(kv_caches.values()))
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         self.current_layer = 0

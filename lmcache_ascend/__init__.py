@@ -255,7 +255,34 @@ def _patch_storage_backend_init():
         CreateStorageBackends as ascend_create_storage_backends,
     )
 
-    lm_storage_backend.CreateStorageBackends = ascend_create_storage_backends
+    upstream_create_storage_backends = lm_storage_backend.CreateStorageBackends
+    from lmcache_ascend.xds_compat import AscendXDSServiceMemoryAllocator
+    import lmcache.v1.memory_management as memory_management
+
+    lm_storage_backend.XDSServiceMemoryAllocator = AscendXDSServiceMemoryAllocator
+    memory_management.XDSServiceMemoryAllocator = AscendXDSServiceMemoryAllocator
+
+    def create_storage_backends(
+        config, metadata, loop, dst_device="cuda", *args, **kwargs
+    ):
+        # The xDS fork owns the xDS/CascadeKV backend setup. Preserve it when
+        # either backend is configured; the upstream Ascend factory omits both.
+        if config.xds_backend or config.cascadekv_backend:
+            import torch
+
+            device = (
+                f"npu:{torch.npu.current_device()}"
+                if metadata.role != "scheduler" and torch.npu.is_available()
+                else "cpu"
+            )
+            return upstream_create_storage_backends(
+                config, metadata, loop, device, *args, **kwargs
+            )
+        return ascend_create_storage_backends(
+            config, metadata, loop, dst_device, *args, **kwargs
+        )
+
+    lm_storage_backend.CreateStorageBackends = create_storage_backends
 
 
 def _patch_torch_capability():

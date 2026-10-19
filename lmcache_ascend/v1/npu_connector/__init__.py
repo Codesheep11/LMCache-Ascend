@@ -62,7 +62,18 @@ def CreateNPUConnector(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
             else:
-                conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
+                connector_class = VLLMPagedMemLayerwiseNPUConnector
+                if config.xds_backend and config.get_extra_config_value(
+                    "xds_layerwise_readv", False
+                ):
+                    if metadata.use_mla or _build_info.__framework_name__ != "pytorch":
+                        raise ValueError("xDS layerwise readv requires PyTorch NHD KV")
+                    from lmcache_ascend.v1.npu_connector.xds_layerwise import (
+                        XDSReadvLayerwiseNPUConnector,
+                    )
+
+                    connector_class = XDSReadvLayerwiseNPUConnector
+                conn = connector_class.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
             return conn

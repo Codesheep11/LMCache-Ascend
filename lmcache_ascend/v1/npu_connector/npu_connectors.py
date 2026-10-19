@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import dataclass, replace
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -15,6 +16,7 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemLayerwiseGPUConnector,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
+from lmcache.v1.gpu_connector.xds_readv import XDSReadvPlan, plan_paged_readv_batch
 from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 import torch
@@ -38,6 +40,114 @@ def is_310p():
 
         _IS_310P = _build_info.__soc_version__.lower().startswith("ascend310p")
     return _IS_310P
+
+
+def get_npu_readv_registration(tensor: torch.Tensor) -> tuple[int, int]:
+    """Validate and return an owned, padded 2 MiB HAL registration range.
+
+    Raises ValueError for non-NPU, unaligned or insufficiently padded tensors.
+    DMA descriptors still cover only the logical KV bytes.
+    """
+    alignment = 2 * 1024 * 1024
+    pointer = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    registered_size = (size + alignment - 1) // alignment * alignment
+    storage = tensor.untyped_storage()
+    if (
+        tensor.device.type != "npu"
+        or pointer % alignment
+        or registered_size <= 0
+        or pointer + registered_size > storage.data_ptr() + storage.nbytes()
+    ):
+        raise ValueError("Ascend readv requires a padded, 2 MiB aligned KV range")
+    return pointer, registered_size
+
+
+@dataclass
+class XDSNPUKVPool:
+    """Own fixed KV tensors and registrations until the backend closes.
+
+    Tensors must not be resized or have their storage replaced during this
+    lifetime. Request-specific slot mappings are never retained here.
+    """
+
+    tensors: tuple[torch.Tensor, ...]
+    registration_ranges: tuple[tuple[int, int], ...]
+    layout: str
+    buffer_refs: Optional[tuple[int, ...]] = None
+    owner: Any = None
+    closed: bool = False
+
+
+def get_xds_kv_tensors(caches: Any) -> tuple[tuple[torch.Tensor, ...], str]:
+    """Flatten supported NHD KV layers; raise ValueError for other layouts."""
+    if not caches:
+        raise ValueError("xDS requires a nonempty KV pool")
+    if all(isinstance(layer, (tuple, list)) and len(layer) == 2 for layer in caches):
+        tensors = tuple(tensor for layer in caches for tensor in layer)
+        layout = "SEPARATE"
+    elif all(isinstance(layer, torch.Tensor) and layer.ndim == 5 for layer in caches):
+        tensors = tuple(caches)
+        if tensors[0].shape[0] == tensors[0].shape[1] == 2:
+            raise ValueError("ambiguous xDS KV layout")
+        layout = "2NB" if tensors[0].shape[0] == 2 else "NB2"
+    else:
+        raise ValueError("unsupported xDS KV layout")
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise ValueError("xDS KV targets must be tensors")
+    return tensors, layout
+
+
+class XDSNPURegistrationMixin:
+    """Initialize fixed KV registration metadata outside the restore path."""
+
+    def initialize_xds_readv_pool(self, caches: Any) -> XDSNPUKVPool:
+        """Validate a fixed NHD pool once; reject replacement until shutdown.
+
+        Raises ValueError for unsupported or unowned HAL ranges, and
+        RuntimeError if a previously initialized pool has changed or closed.
+        The backend registers the returned ranges before accepting requests.
+        """
+        if is_310p() or self.use_mla:
+            raise ValueError("xDS direct registration requires 910B NHD KV")
+        tensors, layout = get_xds_kv_tensors(caches)
+        pool = getattr(self, "xds_readv_pool", None)
+        if pool is not None:
+            if (
+                pool.closed
+                or layout != pool.layout
+                or len(tensors) != len(pool.tensors)
+            ):
+                raise RuntimeError("xDS KV pool replacement requires worker restart")
+            if any(a is not b for a, b in zip(tensors, pool.tensors, strict=True)):
+                raise RuntimeError("xDS KV pool replacement requires worker restart")
+            return pool
+        ranges = tuple(self.get_xds_readv_registration(tensor) for tensor in tensors)
+        pool = XDSNPUKVPool(tensors, ranges, layout)
+        self.xds_readv_pool = pool
+        return pool
+
+    def get_xds_readv_pool(self, caches: Any) -> Optional[XDSNPUKVPool]:
+        """Return initialized metadata without querying tensor storage ranges.
+
+        Return None for standalone planners without a registration lifecycle.
+        Raise RuntimeError for closed, unregistered or replaced production pools.
+        """
+        pool = getattr(self, "xds_readv_pool", None)
+        if pool is None:
+            return None
+        if pool.closed or pool.buffer_refs is None:
+            raise RuntimeError("xDS KV pool is not registered or has closed")
+        tensors, layout = get_xds_kv_tensors(caches)
+        if layout != pool.layout or len(tensors) != len(pool.tensors):
+            raise RuntimeError("xDS KV pool replacement requires worker restart")
+        if any(a is not b for a, b in zip(tensors, pool.tensors, strict=True)):
+            raise RuntimeError("xDS KV pool replacement requires worker restart")
+        return pool
+
+    def get_xds_readv_registration(self, tensor: torch.Tensor) -> tuple[int, int]:
+        """Validate ownership of a padded, 2 MiB aligned HAL registration."""
+        return get_npu_readv_registration(tensor)
 
 
 class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
@@ -420,7 +530,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         yield
 
 
-class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
+class VLLMPagedMemNPUConnectorV2(XDSNPURegistrationMixin, VLLMPagedMemGPUConnectorV2):
     def __init__(
         self,
         hidden_dim_size: int,
@@ -491,6 +601,79 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             head_size=head_size,
             layout_hints=layout_hints,
         )
+
+    def plan_xds_readv_batch(
+        self,
+        chunks: List[
+            tuple[List[torch.Size], List[torch.dtype], MemoryFormat, int, int]
+        ],
+        io_unit: int,
+        **kwargs: Any,
+    ) -> Optional[List[XDSReadvPlan]]:
+        """Plan aligned NHD KV restores without an intermediate NPU copy.
+
+        Supports separate K/V tensors and contiguous merged tensors on 910B.
+        Returns None before DMA for MLA, 310P, partial or overlapping blocks,
+        noncontiguous layouts, and cached-prefix fragments.
+        """
+        if (
+            is_310p()
+            or self.use_mla
+            or any(kwargs.get("vllm_cached_tokens", 0) > chunk[3] for chunk in chunks)
+        ):
+            return None
+        caches = kwargs.get("kvcaches", self.kvcaches)
+        slots = kwargs.get("slot_mapping_cpu", kwargs.get("slot_mapping"))
+        if not caches or not isinstance(slots, torch.Tensor):
+            return None
+        pool = self.get_xds_readv_pool(caches)
+        if pool is not None:
+            tensors = pool.tensors
+            layout = pool.layout
+            registration_ranges = pool.registration_ranges
+        else:
+            try:
+                tensors, layout = get_xds_kv_tensors(caches)
+                registration_ranges = tuple(
+                    self.get_xds_readv_registration(tensor) for tensor in tensors
+                )
+            except ValueError:
+                return None
+        plans = plan_paged_readv_batch(
+            tensors,
+            chunks,
+            slots,
+            io_unit,
+            layout,
+            device_type="npu",
+            registration_ranges=registration_ranges,
+        )
+        if plans is not None and pool is not None:
+            plans = [replace(plan, buffer_refs=pool.buffer_refs) for plan in plans]
+        return plans
+
+    def get_xds_readv_registration(self, tensor: torch.Tensor) -> tuple[int, int]:
+        """Return a 2 MiB HAL range entirely owned by the tensor's storage.
+
+        vLLM Ascend allocates aligned KV views with padding. HAL rejects
+        sub-hugepage lengths; pin the padded range while DMA descriptors cover
+        only logical KV bytes. Reject missing padding before any SSD submission.
+        """
+        return get_npu_readv_registration(tensor)
+
+    def prepare_xds_readv_dma(self, device: torch.device) -> None:
+        """Wait for prior NPU users before SSD DMA can overwrite owned blocks."""
+        if device.type != "npu":
+            raise ValueError("Ascend readv requires NPU target memory")
+        torch.npu.synchronize(device)
+
+    def finish_xds_readv_dma(self, device: torch.device) -> None:
+        """Order NPU consumers after the backend has drained all SSD completions.
+
+        Uses the 910B/CANN coherent device-memory path. No KV copy kernel or
+        CUDA driver call is issued. The backend retains target registrations.
+        """
+        torch.npu.synchronize(device)
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
         self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
@@ -1123,6 +1306,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         # layerwise mode currently does not support MLA
         self.use_mla = kwargs.get("use_mla", False)
+
+    def initialize_kvcaches_ptr(self, **kwargs: Any) -> None:
+        """Initialize contiguous KV views and retain Ascend's tuple ABI.
+
+        The upstream normalizer returns lists for separate K/V layers, while
+        Ascend format detection and kernels require a tuple for each layer.
+        """
+        super().initialize_kvcaches_ptr(**kwargs)
+        if self.kvcaches is not None:
+            self.kvcaches = [
+                tuple(layer) if isinstance(layer, list) else layer
+                for layer in self.kvcaches
+            ]
 
     def _lazy_initialize_buffer(self, kv_caches):
         """
