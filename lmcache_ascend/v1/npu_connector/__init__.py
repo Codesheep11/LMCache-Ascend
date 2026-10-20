@@ -44,6 +44,11 @@ def CreateNPUConnector(
     connector implementations.
     """
     use_gpu = need_gpu_interm_buffer(config)
+    if config.xds_backend and config.get_extra_config_value("xds_direct_kv_io", True):
+        if config.use_layerwise or metadata.use_mla or config.enable_blending:
+            raise ValueError("xDS direct KV mode requires non-layerwise NHD KV")
+        # Neither the backend nor this connector may own a KV payload buffer.
+        use_gpu = False
 
     num_gpus = torch.npu.device_count()
     local_rank = metadata.worker_id % num_gpus

@@ -97,6 +97,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
         assert self.lmcache_engine is not None
 
+        direct_kv_io = bool(
+            self.config.xds_backend
+            and self.config.get_extra_config_value("xds_direct_kv_io", True)
+        )
         # lmcache-ascend start ---------------------
         ordering_event = torch.npu.Event()
         ordering_event.record()
@@ -119,11 +123,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 assert len(slot_mapping) == len(token_ids)
 
                 # lmcache-ascend start ---------------------
-                slot_mapping = slot_mapping.pin_memory()
-                with torch.npu.stream(self.lmcache_engine.gpu_connector.store_stream):
-                    slot_mapping_npu = slot_mapping.to(
-                        device="npu", dtype=torch.long, non_blocking=True
-                    )
+                slot_mapping_npu = None
+                if not direct_kv_io:
+                    slot_mapping = slot_mapping.pin_memory()
+                    with torch.npu.stream(
+                        self.lmcache_engine.gpu_connector.store_stream
+                    ):
+                        slot_mapping_npu = slot_mapping.to(
+                            device="npu", dtype=torch.long, non_blocking=True
+                        )
                 # lmcache-ascend end ---------------------
 
                 skip_leading_tokens = save_spec.skip_leading_tokens
@@ -182,6 +190,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     if request.disagg_spec:
                         request.disagg_spec.num_transferred_tokens = len(token_ids)
             except Exception:
+                if direct_kv_io:
+                    # A failed direct DMA must not be swallowed while vLLM
+                    # continues and reuses the source/target KV blocks.
+                    raise
                 # Do not let one failing request abort the save loop
                 logger.exception(
                     "wait_for_save failed for request %s; skipping save",

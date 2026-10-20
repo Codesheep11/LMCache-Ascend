@@ -86,9 +86,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         self.is_store_async = self.config.store_async
         self._store_queue_maxsize = max(0, int(self.config.store_async_max_queue_size))
+        self._store_queue: Optional[queue.Queue] = None
+        self._store_worker_thread: Optional[threading.Thread] = None
         if self.is_store_async:
-            self._store_queue: Optional[queue.Queue] = None
-            self._store_worker_thread: Optional[threading.Thread] = None
             self._store_lock = threading.Lock()
             self._store_cv = threading.Condition(self._store_lock)
 
@@ -400,8 +400,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
             start_time = time.monotonic()
             self._store_cv.wait_for(
-                lambda: not any(
-                    req_id in self._pending_store_reqs for req_id in req_id_set
+                lambda: (
+                    not any(req_id in self._pending_store_reqs for req_id in req_id_set)
                 )
             )
             elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -473,6 +473,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        if self.config.xds_backend and self.config.get_extra_config_value(
+            "xds_direct_kv_io", True
+        ):
+            if self.is_store_async:
+                raise ValueError(
+                    "xDS direct KV stores must finish inside wait_for_save"
+                )
+            # The base engine negotiates batched_put_from_gpu before allocating
+            # any MemoryObj. Ascend's ordinary pipeline allocates/gathers first.
+            return super().store(tokens, hashes, offsets, mask, **kwargs)
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store operation")
