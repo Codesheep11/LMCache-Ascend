@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Set, Union
 
@@ -618,7 +619,7 @@ class VLLMPagedMemNPUConnectorV2(XDSNPURegistrationMixin, VLLMPagedMemGPUConnect
         ],
         io_unit: int,
         **kwargs: Any,
-    ) -> Optional[List[XDSReadvPlan]]:
+    ) -> Optional[Sequence[XDSReadvPlan]]:
         """Plan aligned NHD KV restores without an intermediate NPU copy.
 
         Supports separate K/V tensors and contiguous merged tensors on 910B.
@@ -658,6 +659,7 @@ class VLLMPagedMemNPUConnectorV2(XDSNPURegistrationMixin, VLLMPagedMemGPUConnect
             registration_ranges=registration_ranges,
             buffer_refs=pool.buffer_refs if pool is not None else None,
             geometry=pool.geometry if pool is not None else None,
+            compact=kwargs.get("xds_compact_batch", False),
         )
         return plans
 

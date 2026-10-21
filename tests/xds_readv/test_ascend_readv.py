@@ -343,3 +343,154 @@ def test_registered_geometry_cannot_be_used_with_another_pool():
             device_type="npu",
             geometry=pool.geometry,
         )
+
+
+@pytest.mark.parametrize("layout", ["SEPARATE", "2NB", "NB2"])
+@pytest.mark.parametrize("count", [1, 5, 33, 129])
+@pytest.mark.parametrize("gapped", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+def test_compact_batch_variable_chunks_preserve_mapping(
+    layout: str, count: int, gapped: bool, native: bool
+) -> None:
+    from lmcache.v1.gpu_connector.xds_readv import XDSPagedReadvBatch
+
+    layers, block_size = 2, 16
+    counts = [1 + i % 3 for i in range(count)]
+    blocks = sum(counts) + 5
+    connector = VLLMPagedMemNPUConnectorV2(256, layers)
+    if layout == "SEPARATE":
+        caches = [
+            (
+                aligned_npu((blocks, block_size, 2, 128)),
+                aligned_npu((blocks, block_size, 2, 128)),
+            )
+            for _ in range(layers)
+        ]
+    else:
+        shape = (
+            (2, blocks, block_size, 2, 128)
+            if layout == "2NB"
+            else (blocks, 2, block_size, 2, 128)
+        )
+        caches = [aligned_npu(shape) for _ in range(layers)]
+    pool = connector.initialize_xds_readv_pool(caches)
+    pool.buffer_refs = tuple(range(101, 101 + len(pool.tensors)))
+    chunks = []
+    position = 0
+    for size in counts:
+        end = position + size * block_size
+        chunks.append(
+            (
+                [torch.Size([2, layers, end - position, 256])],
+                [torch.float16],
+                MemoryFormat.KV_2LTD,
+                position,
+                end,
+            )
+        )
+        position = end + (block_size if gapped else 0)
+    slots = torch.full((position,), -7, dtype=torch.int64, device="cpu")
+    expected_ids = tuple(reversed(range(5, blocks)))
+    cursor = 0
+    for chunk, size in zip(chunks, counts, strict=True):
+        ids = expected_ids[cursor : cursor + size]
+        slots[chunk[3] : chunk[4]] = torch.tensor(
+            [b * block_size + t for b in ids for t in range(block_size)], device="cpu"
+        )
+        cursor += size
+    legacy = connector.plan_xds_readv_batch(
+        chunks, 4096, kvcaches=caches, slot_mapping_cpu=slots
+    )
+    batch = connector.plan_xds_readv_batch(
+        chunks, 4096, kvcaches=caches, slot_mapping_cpu=slots, xds_compact_batch=True
+    )
+    assert isinstance(batch, XDSPagedReadvBatch) and legacy is not None
+    assert len(batch) == count and batch.block_ids == expected_ids
+    assert batch.tensors is pool.tensors and batch.buffer_refs is pool.buffer_refs
+    groups = batch.prepare_groups(pool.buffer_refs)
+    submitted = []
+
+    class Client:
+        supports_native_readv = native
+
+        def prepare_indexed_readv(
+            self, ids: tuple, description: tuple, size: int
+        ) -> list:
+            assert description is groups
+            return [
+                (ref, base + block * stride, size)
+                for ref, base, stride in description
+                for block in ids
+            ]
+
+        def submit_readv_plan(self, handle: int, offset: int, plan: list) -> int:
+            submitted.append((handle, offset, plan))
+            return len(submitted)
+
+        def submit_readv(self, handle: int, offset: int, slices: list) -> int:
+            submitted.append((handle, offset, slices))
+            return len(submitted)
+
+    client = Client()
+    for i in range(count):
+        assert (
+            batch.submit_chunk(client, i, 1000 + i, 4096, pool.buffer_refs, groups)
+            == i + 1
+        )
+        assert submitted[-1] == (
+            1000 + i,
+            4096,
+            legacy[i].bind_slices(pool.buffer_refs),
+        )
+        assert batch[i].bind_slices(pool.buffer_refs) == legacy[i].bind_slices(
+            pool.buffer_refs
+        )
+    assert batch[-1].size == legacy[-1].size
+    with pytest.raises(IndexError):
+        batch.submit_chunk(client, count, 0, 0, pool.buffer_refs, groups)
+    # A new request must not inherit target blocks, even if the input tensor is reused.
+    valid = slots >= 0
+    slots[valid] -= 5 * block_size
+    fresh = connector.plan_xds_readv_batch(
+        chunks, 4096, kvcaches=caches, slot_mapping_cpu=slots, xds_compact_batch=True
+    )
+    assert isinstance(fresh, XDSPagedReadvBatch)
+    assert fresh.block_ids == tuple(b - 5 for b in expected_ids)
+    assert batch.block_ids == expected_ids
+
+
+@pytest.mark.parametrize("failure", ["overlap", "partial", "range", "late_dtype"])
+def test_compact_batch_rejects_invalid_late_target(failure: str) -> None:
+    connector = VLLMPagedMemNPUConnectorV2(256, 1)
+    caches = [(aligned_npu((8, 16, 2, 128)), aligned_npu((8, 16, 2, 128)))]
+    pool = connector.initialize_xds_readv_pool(caches)
+    pool.buffer_refs = (101, 102)
+    chunks = [
+        (
+            [torch.Size([2, 1, 16, 256])],
+            [torch.float16],
+            MemoryFormat.KV_2LTD,
+            start,
+            start + 16,
+        )
+        for start in [0, 16, 32]
+    ]
+    slots = torch.arange(48, device="cpu")
+    if failure == "overlap":
+        slots[32:] = slots[:16]
+    elif failure == "partial":
+        slots[-1] += 1
+    elif failure == "range":
+        slots[32:] += 8 * 16
+    else:
+        chunks[-1][1][0] = torch.float32
+    assert (
+        connector.plan_xds_readv_batch(
+            chunks,
+            4096,
+            kvcaches=caches,
+            slot_mapping_cpu=slots,
+            xds_compact_batch=True,
+        )
+        is None
+    )
