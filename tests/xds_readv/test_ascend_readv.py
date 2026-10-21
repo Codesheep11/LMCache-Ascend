@@ -220,3 +220,61 @@ def test_initialized_pool_reuses_ranges_and_handles_without_storage_queries(
     pool.closed = True
     with pytest.raises(RuntimeError, match="closed"):
         connector.get_xds_readv_pool(caches)
+
+
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_readv_selected_spans_ignore_gaps_and_preserve_chunk_order(slot_dtype):
+    """Unselected slots may be invalid; selected blocks must remain unique."""
+    connector = VLLMPagedMemNPUConnectorV2(256, 2)
+    caches = [
+        (aligned_npu((8, 16, 2, 128)), aligned_npu((8, 16, 2, 128))) for _ in range(2)
+    ]
+    pool = connector.initialize_xds_readv_pool(caches)
+    pool.buffer_refs = (101, 102, 103, 104)
+    chunks = [
+        (
+            [torch.Size([2, 2, 16, 256])],
+            [torch.float16],
+            MemoryFormat.KV_2LTD,
+            s,
+            s + 16,
+        )
+        for s in (32, 0)
+    ]
+    # A strided CPU view also has to produce the exact logical block mapping.
+    backing = torch.full((96,), -999, dtype=slot_dtype)
+    slots = backing[::2]
+    slots[:16] = torch.arange(16, 32, dtype=slot_dtype)
+    slots[32:] = torch.arange(64, 80, dtype=slot_dtype)
+    plans = connector.plan_xds_readv_batch(
+        chunks, 4096, kvcaches=caches, slot_mapping_cpu=slots
+    )
+    assert plans is not None
+    assert [p.block_ids for p in plans] == [(4,), (1,)]
+    assert all(p.buffer_refs is pool.buffer_refs for p in plans)
+    assert plans[0].bind_slices(pool.buffer_refs) == [
+        (ref, 4 * 8192, 8192) for ref in (101, 103, 102, 104)
+    ]
+    # Duplicate physical targets across nonadjacent source spans are rejected.
+    slots[32:] = slots[:16]
+    assert (
+        connector.plan_xds_readv_batch(
+            chunks, 4096, kvcaches=caches, slot_mapping_cpu=slots
+        )
+        is None
+    )
+
+
+def test_readv_rejects_incomplete_registered_references_before_submission():
+    """An initialized pool must cover every K/V target before any DMA."""
+    connector = VLLMPagedMemNPUConnectorV2(256, 1)
+    caches = [(aligned_npu((8, 16, 2, 128)), aligned_npu((8, 16, 2, 128)))]
+    pool = connector.initialize_xds_readv_pool(caches)
+    pool.buffer_refs = (101,)
+    chunks = [
+        ([torch.Size([2, 1, 16, 256])], [torch.float16], MemoryFormat.KV_2LTD, 0, 16)
+    ]
+    with pytest.raises(ValueError, match="reference count"):
+        connector.plan_xds_readv_batch(
+            chunks, 4096, kvcaches=caches, slot_mapping_cpu=torch.arange(16)
+        )

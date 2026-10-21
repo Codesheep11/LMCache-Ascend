@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -647,9 +647,8 @@ class VLLMPagedMemNPUConnectorV2(XDSNPURegistrationMixin, VLLMPagedMemGPUConnect
             layout,
             device_type="npu",
             registration_ranges=registration_ranges,
+            buffer_refs=pool.buffer_refs if pool is not None else None,
         )
-        if plans is not None and pool is not None:
-            plans = [replace(plan, buffer_refs=pool.buffer_refs) for plan in plans]
         return plans
 
     def get_xds_readv_registration(self, tensor: torch.Tensor) -> tuple[int, int]:
