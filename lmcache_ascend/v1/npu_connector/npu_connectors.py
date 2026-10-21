@@ -16,7 +16,12 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemLayerwiseGPUConnector,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.gpu_connector.xds_readv import XDSReadvPlan, plan_paged_readv_batch
+from lmcache.v1.gpu_connector.xds_readv import (
+    XDSPagedKVGeometry,
+    XDSReadvPlan,
+    plan_paged_readv_batch,
+    validate_paged_readv_pool,
+)
 from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 import torch
@@ -77,6 +82,7 @@ class XDSNPUKVPool:
     buffer_refs: Optional[tuple[int, ...]] = None
     owner: Any = None
     closed: bool = False
+    geometry: Optional[XDSPagedKVGeometry] = None
 
 
 def get_xds_kv_tensors(caches: Any) -> tuple[tuple[torch.Tensor, ...], str]:
@@ -123,7 +129,10 @@ class XDSNPURegistrationMixin:
                 raise RuntimeError("xDS KV pool replacement requires worker restart")
             return pool
         ranges = tuple(self.get_xds_readv_registration(tensor) for tensor in tensors)
-        pool = XDSNPUKVPool(tensors, ranges, layout)
+        geometry = validate_paged_readv_pool(tensors, layout, device_type="npu")
+        if geometry is None:
+            raise ValueError("unsupported fixed xDS KV pool layout")
+        pool = XDSNPUKVPool(tensors, ranges, layout, geometry=geometry)
         self.xds_readv_pool = pool
         return pool
 
@@ -648,6 +657,7 @@ class VLLMPagedMemNPUConnectorV2(XDSNPURegistrationMixin, VLLMPagedMemGPUConnect
             device_type="npu",
             registration_ranges=registration_ranges,
             buffer_refs=pool.buffer_refs if pool is not None else None,
+            geometry=pool.geometry if pool is not None else None,
         )
         return plans
 

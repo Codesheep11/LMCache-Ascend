@@ -278,3 +278,68 @@ def test_readv_rejects_incomplete_registered_references_before_submission():
         connector.plan_xds_readv_batch(
             chunks, 4096, kvcaches=caches, slot_mapping_cpu=torch.arange(16)
         )
+
+
+@pytest.mark.parametrize("layout", ["SEPARATE", "2NB", "NB2"])
+def test_registered_geometry_avoids_requerying_target_addresses(layout, monkeypatch):
+    """A fixed pool's layout is validated at startup, while slots stay fresh."""
+    connector = VLLMPagedMemNPUConnectorV2(256, 2)
+    if layout == "SEPARATE":
+        caches = [
+            (aligned_npu((8, 16, 2, 128)), aligned_npu((8, 16, 2, 128)))
+            for _ in range(2)
+        ]
+    else:
+        shape = (2, 8, 16, 2, 128) if layout == "2NB" else (8, 2, 16, 2, 128)
+        caches = [aligned_npu(shape) for _ in range(2)]
+    pool = connector.initialize_xds_readv_pool(caches)
+    pool.buffer_refs = tuple(range(101, 101 + len(pool.tensors)))
+
+    def unexpected_query():
+        raise AssertionError("hot-path target address query")
+
+    for t in pool.tensors:
+        monkeypatch.setattr(t, "data_ptr", unexpected_query)
+        monkeypatch.setattr(t, "untyped_storage", unexpected_query)
+    chunks = [
+        ([torch.Size([2, 2, 16, 256])], [torch.float16], MemoryFormat.KV_2LTD, 0, 16)
+    ]
+    for block in (4, 1):
+        plans = connector.plan_xds_readv_batch(
+            chunks,
+            4096,
+            kvcaches=caches,
+            slot_mapping_cpu=torch.arange(block * 16, (block + 1) * 16),
+        )
+        assert plans is not None and plans[0].block_ids == (block,)
+        assert plans[0].size == 2 * 2 * 16 * 256 * 2
+        assert plans[0].buffer_refs is pool.buffer_refs
+    # I/O compatibility remains request-specific even with a fixed pool.
+    assert (
+        connector.plan_xds_readv_batch(
+            chunks, 65536, kvcaches=caches, slot_mapping_cpu=torch.arange(16)
+        )
+        is None
+    )
+
+
+def test_registered_geometry_cannot_be_used_with_another_pool():
+    from lmcache.v1.gpu_connector.xds_readv import plan_paged_readv_batch
+
+    connector = VLLMPagedMemNPUConnectorV2(256, 1)
+    caches = [(aligned_npu((8, 16, 2, 128)), aligned_npu((8, 16, 2, 128)))]
+    pool = connector.initialize_xds_readv_pool(caches)
+    different = tuple(t.clone() for t in pool.tensors)
+    chunks = [
+        ([torch.Size([2, 1, 16, 256])], [torch.float16], MemoryFormat.KV_2LTD, 0, 16)
+    ]
+    with pytest.raises(ValueError, match="geometry"):
+        plan_paged_readv_batch(
+            different,
+            chunks,
+            torch.arange(16),
+            4096,
+            "SEPARATE",
+            device_type="npu",
+            geometry=pool.geometry,
+        )
