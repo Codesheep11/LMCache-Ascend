@@ -28,9 +28,13 @@ In the table above, “hybrid KV cache management formats” means **MLA/DSA mul
 
 ## Documents
 
+- [xds_worker.md](xds_worker.md) — Codesheep11 fork: deploy xDS on a new Ascend 910B server with vLLM 0.26.0 / LMCache 0.5.6, worker-owned HBM P2P I/O, and MLA leader reads. This is a separate transfer mode with its own version pins and limitations.
+
 - [lmcache_driven.md](lmcache_driven.md) — the `lmcache_driven` transfer mode full deployment guide: environment preparation, container startup, source installation, server/vLLM startup, and verification (DeepSeek-V4 example).
 - [engine_driven.md](engine_driven.md) — deploy and run the `engine_driven` transfer mode (Qwen3 example).
 
 ## Relationship to the LMCache dev branch
 
-The MP architecture (the `lmcache server` CLI, the `LMCacheMPConnector`, and the transfer-mode layer) is developed on the LMCache `dev` branch — the main line — and the matching Ascend backends (NPU platform routing, block-transfer ops, hccl/hixl bindings) live in the LMCache-Ascend repository. Install both from the official repositories only — see the installation section of [lmcache_driven.md](lmcache_driven.md) for the exact procedure. The classic in-process connector (`LMCacheAscendConnectorV1Dynamic`) is a separate integration that uses its own LMCache release line; its installation must not be mixed with the MP-mode checkout in one Python environment.
+The MP architecture (the `lmcache server` CLI, the `LMCacheMPConnector`, and the transfer-mode layer) is developed on the LMCache `dev` branch — the main line — and the matching Ascend backends (NPU platform routing, block-transfer ops, hccl/hixl bindings) live in the LMCache-Ascend repository. For the two standard modes above, install both from the official repositories — see the installation section of [lmcache_driven.md](lmcache_driven.md) for the exact procedure. The classic in-process connector (`LMCacheAscendConnectorV1Dynamic`) is a separate integration that uses its own LMCache release line; its installation must not be mixed with the MP-mode checkout in one Python environment.
+
+The fork-specific `xds_worker` deployment instead requires the matching Codesheep11 repositories listed in [xds_worker.md](xds_worker.md). Its MP server manages metadata; KV payload I/O runs in the owning vLLM worker rather than the server. Do not mix its pinned stack with the standard-mode installation instructions above.
