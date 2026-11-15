@@ -10,6 +10,7 @@ from unittest.mock import Mock
 # Third Party
 from lmcache.v1.multiprocess import xds_transfer as common_transfer
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.xds_catalog import XDSExtent, XDSLease
 import pytest
 import torch
@@ -58,7 +59,10 @@ def transfer(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) ->
         num_readers=4 if replica else 1,
         writer=not replica,
     )
-    context.register(caches, "model", 1, blocks_in_chunk, 1.0)
+    groups = settings.get("groups", ()) if isinstance(settings, dict) else ()
+    context.register(
+        caches, "model", 1, blocks_in_chunk, 1.0, engine_group_infos=groups
+    )
     rpc.reset_mock()
     return context, caches, client, rpc
 
@@ -418,3 +422,45 @@ def test_replica_imports_survive_until_dma_drains(
         assert names.index("client.wait") < names.index("client.unimport_blob_read")
         context.close()
         client.release_blob.assert_not_called()
+
+
+@pytest.mark.parametrize("widths", [(576,), (128,), (128, 16)])
+def test_dsa_planes_retained_without_payload_copy(
+    transfer: tuple, widths: tuple[int, ...]
+) -> None:
+    context, _, _, _ = transfer
+    tensors = tuple(torch.empty((16, 128, 1, width), device="cpu") for width in widths)
+    assert context.prepare_planes({"indexer": tensors}) == tensors
+    context.close()
+
+
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        {
+            "blocks": 1,
+            "groups": (EngineGroupInfo(0, (0,), 128), EngineGroupInfo(0, (1,), 128)),
+        }
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("operation", ["submit_store", "submit_retrieve"])
+def test_physical_groups_use_one_shared_block_map(
+    transfer: tuple, operation: str
+) -> None:
+    context, caches, client, rpc = transfer
+    leases = tuple(XDSLease(str(i), XDSExtent(1, i * 8192, 8192)) for i in range(2))
+    rpc.return_value.result.return_value = leases
+    future = getattr(context, operation)(
+        "req", key(), caches, [[5, 2], [5, 2]], None, 1
+    )
+    assert future.result() is True
+    assert client.wait.call_count == 2
+    client.reset_mock()
+    rpc.reset_mock()
+    with pytest.raises(ValueError, match="group geometry"):
+        getattr(context, operation)("req", key(), caches, [[5, 2], [2, 5]], None, 1)
+    rpc.assert_not_called()
+    client.submit_writev.assert_not_called()
+    client.submit_readv.assert_not_called()
+    context.close()

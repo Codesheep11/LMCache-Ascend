@@ -325,3 +325,38 @@ python -m pytest -q --confcutdir=tests/v1/xds tests/v1/xds
 | 延迟抖动 / TTFT 高 | 检查共享 NPU/CPU/SSD 负载、NUMA、GC、元数据调度和通信等待；不能仅凭 TTFT 推断 SSD 慢 |
 
 旧的 `xds_read_slot_count` / `xds_write_slot_count` 和旧 YAML `xds_backend` 配置不用于本文路线。升级源码前保存 commit manifest、依赖清单和启动配置；先在独立目录/容器验收，再切换现有服务。
+
+## 11. DSA/C8 scale 页适配与已验证范围
+
+GLM 的 FP16 indexer scale 在 block size 128 时只有 256 字节，小于当前 SSD 的 512 字节 I/O 单位。为兼容 4 KiB I/O 单位的设备，适配统一按 4 KiB 对齐。不能直接把 I/O 长度向上取整，否则会覆盖相邻 block。适配使用最终 HBM 页内 padding，不引入 payload 暂存区：每个 scale block 的物理大小取 4 KiB 的整数倍，逻辑 scale 连续放在该页开头。页宽按 block size 和 dtype 计算，不依赖请求长度。
+
+这需要配套的 vLLM-Ascend 修改：分配时计入 padding、scale 写入使用物理页步长、LightningIndexerQuant 使用独立 scale 页步长。必须重编译并同时部署 host tiling 和 device kernel，不能仅更新 Python 或混用新旧二进制。当前路径针对 910B/910C 自定义 indexer；A5 路径明确拒绝启用。
+
+LMCache 允许同一 engine group 下的多个物理格式组，但每次传输要求它们的 block map 完全一致；LMCache-Ascend 接受 main KV、indexer key 和 scale 等不同宽度的 4D planes。各 plane 仍必须满足 xDS 的 I/O 对齐要求。独立 block map、滑窗和 recurrent group 不在此次适配范围内。
+
+当前布局及模拟传输回归已通过；四类 plane 的 NPU/SSD 非连续 block 往返字节校验也已通过（含 4 KiB scale 页及未选中 block 的保护检查）。真实 indexer 算子的 padding/未 padding 对照也已通过。GLM TP8 无 connector 的三个短生成检查通过。默认 BF16 indexer 的 GLM/xDS 路径已通过 1K 缓存命中 + 128 新 token 的三次恢复：八卡共 24 次污染后字节检查一致，每卡每次 97,517,568 字节，冷/热输出文本一致。显式 `enable_sparse_li_c8=true` 的 GLM padding 路径已通过 3K（3072）缓存命中 + 128 新 token：三次恢复、八卡共 24 次污染后字节检查一致，每卡每次 287,834,112 字节（274.5 MiB），冷/热输出文本一致。实际缓存包含 78 对 BF16 main KV、16 个 INT8 indexer + FP16 scale 组合及 5 个 BF16 indexer；每个 FP16 scale 页为 `[128, 1, 16]`，共 4 KiB。测试中用于校验的 CPU 拷贝不属于生产 I/O 路径；这些计时不能作为性能数据，短请求检查也不能替代完整准确率或并发验收。
+
+### 单独构建修改后的 indexer 算子
+
+在含上述源码修改的容器内构建独立 vendor，保留原 vendor 供其他算子使用。以下副本排除项以根目录锚定，不能排除依赖源码内部同名的 `build` 或 `output` 目录。
+
+```bash
+mkdir -p /upgrade/build/xds-scale/csrc
+rsync -a --exclude=/build/ --exclude=/build_out/ --exclude=/output/ \
+  /vllm-workspace/vllm-ascend/csrc/ /upgrade/build/xds-scale/csrc/
+cd /upgrade/build/xds-scale/csrc
+bash build.sh --pkg --soc=ascend910b --ops=lightning_indexer_quant --vendor_name=xds_scale -j8
+cmake --install build --prefix /upgrade/run/xds-scale-ops
+export ASCEND_CUSTOM_OPP_PATH=/upgrade/run/xds-scale-ops/packages/vendors/xds_scale_transformer:/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer:${ASCEND_CUSTOM_OPP_PATH:-}
+export LD_LIBRARY_PATH=/upgrade/run/xds-scale-ops/packages/vendors/xds_scale_transformer/op_api/lib:${LD_LIBRARY_PATH:-}
+```
+
+将以上两个环境变量传入启动 vLLM 的进程。切换 C8/padding 布局时重启 vLLM 和 MP server 并重新建立缓存，不能沿用旧布局的缓存对象。显式开启 C8 indexer 时，在 `--additional-config` 中加入 `"enable_sparse_li_c8": true`；该开关默认关闭，checkpoint 名称含 `c8` 不意味着运行时已启用。主 MLA KV 此时仍为 BF16；不要把它误报为主 KV 全部 INT8。
+
+先运行真实 NPU 算子对照测试，确认当前进程加载的是新 host tiling 和 device kernel：
+
+```bash
+cd /vllm-workspace/vllm-ascend
+python -m pytest -q --confcutdir=tests/e2e/pull_request/one_card \
+  tests/e2e/pull_request/one_card/test_xds_indexer_scale_padding.py
+```

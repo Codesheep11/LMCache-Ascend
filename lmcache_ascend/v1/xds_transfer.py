@@ -20,12 +20,17 @@ class XDSWorkerTransferContext(BaseXDSContext):
     def prepare_planes(
         self, kv_caches: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, ...]:
-        """Return separate Ascend NHD latent/RoPE or K/V planes without copying."""
+        """Retain block-major Ascend KV and separate DSA indexer/scale planes.
+
+        Single-plane packed C8 and indexer entries are retained as-is.
+        Registration separately validates ownership, geometry and I/O alignment;
+        accepting a layout here does not make sub-I/O-unit scale pages safe.
+        """
         planes: list[torch.Tensor] = []
         for value in kv_caches.values():
-            if not isinstance(value, (tuple, list)) or len(value) != 2:
+            if not isinstance(value, (tuple, list)) or not value:
                 raise ValueError(
-                    "xDS Ascend requires separate block-major K and V planes"
+                    "xDS Ascend requires nonempty tuples of block-major cache planes"
                 )
             planes.extend(value)
         if not planes or any(t.ndim != 4 for t in planes):
